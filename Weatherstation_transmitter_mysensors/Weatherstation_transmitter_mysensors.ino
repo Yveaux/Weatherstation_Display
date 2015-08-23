@@ -45,9 +45,12 @@ const uint8_t mysns_id    = 80;
 #define LED_PIN               (9)
 #define MYSNS_RF24_CE_PIN     (7)
 #define MYSNS_RF24_CS_PIN     (8)
-#define RETRY_TIMEOUT_MS      (2000UL)
-#define CLOCK_UPDATE_TIMEOUT_MS   (3600000UL)
-#define SENSOR_UPDATE_TIMEOUT_MS  (120000UL)
+
+#define RETRY_TIMEOUT_MS          (5UL*1000UL)         // 5 seconds
+#define CLOCK_UPDATE_TIMEOUT_MS   (60UL*60UL*1000UL)   // 1 hour
+#define DISPLAY_UPDATE_TIMEOUT_MS (1UL*60UL*1000UL)    // 1 minute  (display blanks after 6:30 without data)
+
+static const mysensor_data sensors[] = { V_TEMP, V_HUM, V_WIND, V_GUST, V_RAIN };
 
 MyTransportNRF24 radio(MYSNS_RF24_CE_PIN, MYSNS_RF24_CS_PIN, RF24_PA_LEVEL);
 MyHwATMega328 hw; 
@@ -135,6 +138,9 @@ static void sendPacket(uint8_t const * data, int len, uint8_t repeat = 3)
 
   while (repeat-- > 0)
   {
+    // Start with 1 byte 'silence'
+    writeReg(REG_FIFO, 0);
+    
     uint16_t tx = 0;
     uint8_t b = 16;
     for (uint8_t i = 0; i < len; ++i)
@@ -198,7 +204,7 @@ static void ook_initialize()
   writeReg(REG_PAYLOADLEN, 0x00);     // PayloadLength = 0, unlimited
   setFrequency(868280);
 
-  const uint32_t br = 32000000L / 2000;   // 2000kbit/s
+  const uint32_t br = 32000000L / 2000;   // 2000bit/s
   writeReg(REG_BRMSB, br >> 8);
   writeReg(REG_BRMSB + 1, br);
 }
@@ -281,10 +287,21 @@ void receiveTime(unsigned long time)
   time_received = true;
 }
 
-static const mysensor_data data[] = { V_TEMP, V_HUM, V_WIND, V_GUST, V_RAIN };
-unsigned long last_updates[ARRAY_SIZE(data)];
-static SensorData sns_data;
+uint8_t get_sns_idx( const uint8_t sns )
+{
+  for (uint8_t i = 0; i < ARRAY_SIZE(sensors); ++i)
+  {
+    if (sensors[i] == sns)
+      return i;
+  }
+  return 0;
+}
 
+
+//static unsigned long last_update;
+static SensorData sns_data;
+static bool sns_forcetx = false;    // Trigger immediate send of sensor data
+static uint8_t sns_updated = 0;     // Keeps track of which sensor was updated since last mark.
 void incomingMessage(const MyMessage &message)
 {
   float v = atof( message.data );
@@ -298,19 +315,12 @@ void incomingMessage(const MyMessage &message)
     default:
       return;
   }
-  // Store timestamp of last update, so we know the age of the value.
-  for (uint8_t i = 0; i < ARRAY_SIZE(data); ++i)
-  {
-    if (data[i] == message.type)
-    {
-      last_updates[i] = millis();
-    }
-  }
+  sns_updated |= 1 << get_sns_idx(message.type);
 }
 
 void setup () {
   Serial.begin(SERIAL_BAUD);
-  Serial.println("Weerstation transmitter");
+  Serial.println("Weatherstation transmitter");
 
   rf12_initialize(0x81, RF12_868MHZ, 212, 1600);
 
@@ -319,7 +329,7 @@ void setup () {
   gw.begin( incomingMessage, mysns_id );
 
   // Send the sketch version information to the gateway and Controller
-  gw.sendSketchInfo("Weatherstation", "1.0");
+  gw.sendSketchInfo("Weatherdisplay", "1.0");
 }
 
 void statemachine_time(void)
@@ -350,10 +360,12 @@ void statemachine_time(void)
       }
       else if (millis() >= timeout)
       {
+        Serial.println("Failed to retrieve time. Retry.");
         state = 0;
       }
       break;
     case 2:
+      // Wait until it's time to update the clock again.
       if (millis() >= timeout)
       {
         state = 0;
@@ -362,92 +374,100 @@ void statemachine_time(void)
   }
 }
 
-void statemachine_sns(void)
+void statemachine_snsrx(void)
 {
   static uint8_t state  = 0;
   static uint8_t idx_sns;
   static unsigned long timeout;
-  const uint8_t illegal_type = 0xFF;
-  static unsigned long prev_test;
-  
+    
   switch (state)
   {
     case 0:
-      Serial.println("Start sensor update");
+      // First request all values once and wait for a response to be received.
+      // When finished, the gateway knows which values we're interested in and thus
+      // has created a subscription for each of our values.
       idx_sns = 0;
-      state   = 1;
+      sns_updated = 0;
+      state = 1;
       break;  
     case 1:
-      if (idx_sns >= ARRAY_SIZE(data))
+      if (idx_sns >= ARRAY_SIZE(sensors))
       {
-        // All sensor values have been updated
-        Serial.println("All sensors updated");
+        // All sensor values have been updated & subscribed to
+        Serial.println("All sensors subscribed");
         state = 3;
-      }
-      else
-      {
+      } else {
         // Update next sensor value
-        Serial.print("Request update "); Serial.println(data[idx_sns]);
-        gw.request( 0, data[idx_sns] ); 
+        Serial.print("Request update (subscribe to) "); Serial.println(sensors[idx_sns]);
+        gw.request( 0, sensors[idx_sns] ); 
         timeout = millis() + RETRY_TIMEOUT_MS;
-        last_updates[idx_sns] = 0UL;  // Reset last update time, so we know when value has been refreshed.
         state = 2;
       }
       break;
     case 2:
-      if (last_updates[idx_sns])
+      // Wait until we receive a value for the sensor we've currently requested
+      // (and not a value pushed for a sensor we've subscribed to before)
+      if (sns_updated & (1 << idx_sns))
       {
-        Serial.println("Got data");
+        Serial.println("Got data (subscribed)");
         ++idx_sns;
         state = 1;
-        break;
-      }
-      else if (millis() >= timeout)
-      {
+      } else if (millis() >= timeout) {
         // No value received. Try again.
-        Serial.println("No data, retrying");
+        Serial.println("No data, retry");
         state = 1;
       }
       break;
     case 3:
       // Send sensor data to display.
-      sendSensorPacket( id, sns_data );
-      prev_test = millis();
+      sns_forcetx = true;
+      // Keep track of which sensor got updated
+      sns_updated = 0;
       state = 4;
       break;
     case 4:
-      // Monitor pushed updates for each variable.
-      // If it takes too long, a forced update of all variables will be started.
-      for (uint8_t i = 0; i < ARRAY_SIZE(data); ++i)
+      if (sns_updated)
       {
-        if (!last_updates[i] || (millis() - last_updates[i]) > SENSOR_UPDATE_TIMEOUT_MS )
-        {
-          // Restart sensor update sequence.
-          state = 0;
-          break;
-        }
-        else if (last_updates[i] >= prev_test)
-        {
-          // A sensor value got updated since last test.
-          // Wait a little (more values might come in) then send out the new data.
-          timeout = millis() + RETRY_TIMEOUT_MS;    // Retry timeout seems like a sane delay
-          state = 5;
-        }
+        // At least one sensor got udated. Wait a short while before sending,
+        // as updates usually come in batches.
+        timeout = millis() + RETRY_TIMEOUT_MS;  // Retry timeout seems to be a sane value
+        state = 5;
       }
-      prev_test = millis();
       break;
     case 5:
-      if (millis() >= timeout)
-      {
-        // One or more updated values. Send them.
-        Serial.println("Send updated data");
+      if (millis() >= timeout) {
         state = 3;
       }
       break;
   }
 }
+
+void statemachine_snstx(void)
+{
+  static uint8_t state  = 0;
+  static unsigned long timeout;
+    
+  switch (state)
+  {
+    case 0:
+      Serial.println("Wait for sensor update, or timeout");
+      timeout = millis() + DISPLAY_UPDATE_TIMEOUT_MS;
+      sns_forcetx = false;
+      state = 1;
+      break;  
+    case 1:
+      if (sns_forcetx || (millis() >= timeout))
+      {
+        // Send sensor data to display.
+        sendSensorPacket( id, sns_data );
+        state = 0;
+      }
+  }
+}
+
 void loop () {
   gw.process();
   statemachine_time();
-  statemachine_sns();
+  statemachine_snsrx();
+  statemachine_snstx();
 }

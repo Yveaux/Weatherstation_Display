@@ -182,7 +182,7 @@ static void ook_initialize()
   writeReg(REG_PAYLOADLEN, 0x00);     // PayloadLength = 0, unlimited
   setFrequency(868280);
 
-  const uint32_t br = 32000000L / 2000;   // 2000kbit/s
+  const uint32_t br = 32000000L / 2000;   // 2000bit/s
   writeReg(REG_BRMSB, br >> 8);
   writeReg(REG_BRMSB + 1, br);
 }
