@@ -47,8 +47,8 @@ const uint8_t mysns_id    = 80;
 #define MYSNS_RF24_CS_PIN     (8)
 
 #define RETRY_TIMEOUT_MS          (5UL*1000UL)         // 5 seconds
-#define CLOCK_UPDATE_TIMEOUT_MS   (60UL*60UL*1000UL)   // 1 hour
-#define DISPLAY_UPDATE_TIMEOUT_MS (1UL*60UL*1000UL)    // 1 minute  (display blanks after 6:30 without data)
+#define CLOCK_UPDATE_TIMEOUT_MS   (5UL*60UL*1000UL)    // 5 minutes
+#define DISPLAY_UPDATE_TIMEOUT_MS (12UL*1000UL)        // 48/4 seconds  (display blanks after 6:30 without data)
 
 static const mysensor_data sensors[] = { V_TEMP, V_HUM, V_WIND, V_GUST, V_RAIN };
 
@@ -132,7 +132,8 @@ inline uint16_t swap16(const uint16_t v)
   return ((v & 0xFF) << 8) | ((v >> 8) & 0xFF);
 }
 
-static void sendPacket(uint8_t const * data, int len, uint8_t repeat = 3)
+/* Base station alternates between 1 and 2 repeats */
+static void sendPacket(uint8_t const * data, int len, uint8_t repeat = 2)
 {
   print_hex(data, len); Serial.println("");
 
@@ -190,7 +191,7 @@ static void sendPacket(uint8_t const * data, int len, uint8_t repeat = 3)
     setMode(MODE_STANDBY);
     activityLed(false);
 
-    delay(100);
+    delay(112);
   }
 }
 
@@ -202,9 +203,9 @@ static void ook_initialize()
   writeReg(REG_SYNCCONFIG, 0x00);     // SyncConfig = sync OFF
   writeReg(REG_PKTCONFIG1, 0x80);     // PacketConfig1 = variable length, advanced items OFF
   writeReg(REG_PAYLOADLEN, 0x00);     // PayloadLength = 0, unlimited
-  setFrequency(868280);
+  setFrequency(868365);               // Using SDR scanner this frequency seems to match frequency of sending base station.
 
-  const uint32_t br = 32000000L / 2000;   // 2000bit/s
+  const uint32_t br = 32000000L / 1972;   // 1972bit/s, seems to match bitrate of sending base station.
   writeReg(REG_BRMSB, br >> 8);
   writeReg(REG_BRMSB + 1, br);
 }
